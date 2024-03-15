@@ -1,37 +1,22 @@
 #![feature(repr_simd)]
 #![feature(simd_ffi)]
 
-#![feature(pointer_byte_offsets)]
-#![feature(new_uninit)]
-#![feature(vec_into_raw_parts)]
-use crate::navigation::CurrentNavigation;
-
-mod navigation;
-mod input;
-mod keyboard;
-mod playaid;
-
-use skyline;
-use acmd::acmd;
-use smash::lib::lua_const::*;
-use smash::app;
-use smash::phx::{ Vector3f };
-use smash::app::lua_bind;
-use smash::lib::{ lua_const, L2CValue };
-use smash::app::{ utility, sv_system, smashball };
-use smash::hash40;
-use smash::lua2cpp::{ L2CFighterCommon, L2CFighterBase, L2CFighterBase_global_reset };
-use serde_json::json;
-use std::sync::atomic::{ AtomicU32, Ordering };
-use std::sync::Mutex;
-use std::fs::File;
-use std::fs::OpenOptions;
-use lazy_static::lazy_static;
-use std::io::Write;
-use std::cell::RefCell;
-use std::rc::Rc;
-use skyline::nn::{ time };
-use std::time::{ SystemTime, UNIX_EPOCH };
+use {
+    lazy_static::lazy_static,
+    serde::{Serialize, Deserialize},
+    skyline::{self, nn::time},
+    smash::app,
+    smash::app::{utility, lua_bind, FighterManager, FighterEntryID, FighterInformation, BattleObjectModuleAccessor},
+    smash::app::lua_bind::*,
+    smash::lib::{L2CValue, lua_const},
+    smash::lib::lua_const::*,
+    smash::lua2cpp::{L2CFighterBase, L2CFighterCommon, L2CFighterBase_global_reset},
+    std::fs::{File, OpenOptions},
+    std::io::Write,
+    std::sync::Mutex,
+    std::sync::atomic::{AtomicU32, Ordering},
+    std::time::{SystemTime, UNIX_EPOCH},
+};
 
 lazy_static! {
     static ref FILE_PATH: Mutex<String> = Mutex::new(String::new());
@@ -127,19 +112,13 @@ pub fn on_match_start_or_end(fighter: &mut L2CFighterBase) -> L2CValue {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis();
-        // *file_path = format!("sd:/fight-{}-vs-{}-{}.txt", fighter1, fighter2, event_time);
-
-        let mut replay_id = "XXXXXXXX";
-        unsafe {
-            // This is index - 1 because we increment right after we input info into the keyboard.
-            // This is sloppy code.
-            replay_id = playaid::TEST_ID[playaid::ID_INDEX - 1];
-        }
-
-        *file_path = format!("sd:/{}-{}.txt", replay_id, event_time);
+        *file_path = format!("sd:/fight-{}-vs-{}-{}.txt", fighter1, fighter2, event_time);
         File::create(&*file_path);
 
-        let file = OpenOptions::new().write(true).append(true).open(&*file_path);
+        let file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&*file_path);
 
         let mut file = match file {
             Err(e) => panic!("Couldn't open file: {}", e),
@@ -169,16 +148,61 @@ macro_rules! actionable_statuses {
     };
 }
 
-unsafe fn can_act(module_accessor: *mut app::BattleObjectModuleAccessor) -> bool {
-    smash::app::lua_bind::CancelModule::is_enable_cancel(module_accessor) ||
-        actionable_statuses!()
-            .iter()
-            .any(|actionable_transition| {
-                smash::app::lua_bind::WorkModule::is_enable_transition_term(
-                    module_accessor,
-                    **actionable_transition
-                )
-            })
+unsafe fn can_act(module_accessor: *mut BattleObjectModuleAccessor) -> bool {
+    lua_bind::CancelModule::is_enable_cancel(module_accessor)
+        || actionable_statuses!().iter().any(|actionable_transition| {
+            WorkModule::is_enable_transition_term(
+                module_accessor,
+                **actionable_transition,
+            )
+        })
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Coordinate {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+
+// The X position ranges between -1 and 1.
+// -1.0 is left, 1.0 is right
+// The Y position ranges between -1 and 1.
+// -1.0 is full-down, 1.0 is full-up.
+#[derive(Serialize, Deserialize, Debug)]
+struct StickPosition {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct LogEntry {
+    num_frames_left: u32,
+    fighter_id: i32,
+    fighter_name: i32,
+    stock_count: u8,
+    status_kind: i32,
+    motion_kind: u64,
+    damage: f32,
+    shield_size: f32,
+    facing: f32,
+    pos_x: f32,
+    pos_y: f32,
+    hitstun_left: f32,
+    attack_connected: bool,
+    animation_frame_num: f32,
+    can_act: bool,
+    camera_position: Coordinate,
+    camera_target_position: Coordinate,
+    camera_fov: f32,
+    stage_id: i32,
+    stick_position: StickPosition,
+    pressing_attack: bool,
+    pressing_special: bool,
+    pressing_shield: bool,
+    pressing_jump: bool,
+    pressing_grab: bool,
 }
 
 pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
@@ -188,11 +212,10 @@ pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
     let mut buffer = BUFFER.lock().unwrap();
 
     unsafe {
-        let module_accessor = smash::app::sv_system::battle_object_module_accessor(
-            fighter.lua_state_agent
-        );
+        let module_accessor =
+            smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
 
-        let fighter_manager = *(FIGHTER_MANAGER_ADDR as *mut *mut app::FighterManager);
+        let fighter_manager = *(FIGHTER_MANAGER_ADDR as *mut *mut FighterManager);
 
         // If True, the game has started and the characters can move around.  Otherwise, it's still loading with the
         // countdown.
@@ -207,13 +230,13 @@ pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
 
         let fighter_id = lua_bind::WorkModule::get_int(
             module_accessor,
-            *lua_const::FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID
+            *lua_const::FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID,
         ) as i32;
 
         let fighter_information = lua_bind::FighterManager::get_fighter_information(
             fighter_manager,
-            app::FighterEntryID(fighter_id)
-        ) as *mut app::FighterInformation;
+            FighterEntryID(fighter_id),
+        ) as *mut FighterInformation;
         let stock_count = lua_bind::FighterInformation::stock_count(fighter_information) as u8;
         let fighter_status_kind = lua_bind::StatusModule::status_kind(module_accessor);
         let fighter_name = utility::get_kind(module_accessor);
@@ -221,24 +244,23 @@ pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
         let fighter_damage = lua_bind::DamageModule::damage(module_accessor, 0);
         let fighter_shield_size = lua_bind::WorkModule::get_float(
             module_accessor,
-            *lua_const::FIGHTER_INSTANCE_WORK_ID_FLOAT_GUARD_SHIELD
+            *lua_const::FIGHTER_INSTANCE_WORK_ID_FLOAT_GUARD_SHIELD,
         );
         let attack_connected = lua_bind::AttackModule::is_infliction_status(
             module_accessor,
-            *lua_const::COLLISION_KIND_MASK_HIT
+            *lua_const::COLLISION_KIND_MASK_HIT,
         );
         let hitstun_left = lua_bind::WorkModule::get_float(
             module_accessor,
-            *lua_const::FIGHTER_INSTANCE_WORK_ID_FLOAT_DAMAGE_REACTION_FRAME
+            *lua_const::FIGHTER_INSTANCE_WORK_ID_FLOAT_DAMAGE_REACTION_FRAME,
         );
         let can_act = can_act(module_accessor);
         let pos_x = lua_bind::PostureModule::pos_x(module_accessor);
         let pos_y = lua_bind::PostureModule::pos_y(module_accessor);
         let facing = lua_bind::PostureModule::lr(module_accessor);
         let cam_pos = get_camera_pos();
-        let internal_cam_pos = get_internal_camera_pos();
         let cam_target = get_camera_target();
-        let cam_fov = get_camera_fov();
+        let camera_fov = get_camera_fov();
         let stage_id = get_stage_id();
         let animation_frame_num = smash::app::lua_bind::MotionModule::frame(module_accessor);
 
@@ -252,41 +274,57 @@ pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
             *fighter2 = format!("{}", fighter_name);
         }
 
-        let json_log =
-            json!({
-            "num_frames_left": num_frames_left,
-            "fighter_id": fighter_id,
-            "fighter_name": fighter_name,
-            "stock_count": stock_count,
-            "status_kind": fighter_status_kind,
-            "motion_kind": fighter_motion_kind,
-            "damage": fighter_damage,
-            "shield_size": fighter_shield_size,
-            "facing": facing,
-            "pos_x": pos_x,
-            "pos_y": pos_y,
-            "hitstun_left": hitstun_left,
-            "attack_connected": attack_connected,
-            "animation_frame_num": animation_frame_num,
-            "can_act": can_act,
-            "camera_position": {
-                "x": cam_pos.x,
-                "y": cam_pos.y,
-                "z": cam_pos.z,
-            },
-            "camera_target_position": {
-                "x": cam_target.x,
-                "y": cam_target.y,
-                "z": cam_target.z,
-            },
-            "camera_fov": cam_fov,
-            "stage_id": stage_id,
-        });
+        let stick_position = StickPosition {
+            x: ControlModule::get_stick_x(fighter.module_accessor),
+            y: ControlModule::get_stick_y(fighter.module_accessor),
+        };
 
-        let PUSH_TO_BUFFER = true;
-        if PUSH_TO_BUFFER {
-            buffer.push_str(&format!("{}\n", json_log));
-        }
+        // Check which buttons are being pressed by the player:
+        let pressing_attack = ControlModule::check_button_on(fighter.module_accessor, *CONTROL_PAD_BUTTON_ATTACK);
+        let pressing_special = ControlModule::check_button_on(fighter.module_accessor, *CONTROL_PAD_BUTTON_SPECIAL);
+        let pressing_shield = ControlModule::check_button_on(fighter.module_accessor, *CONTROL_PAD_BUTTON_GUARD);
+        let pressing_jump = ControlModule::check_button_on(fighter.module_accessor, *CONTROL_PAD_BUTTON_JUMP);
+        let pressing_grab = ControlModule::check_button_on(fighter.module_accessor, *CONTROL_PAD_BUTTON_CATCH);
+
+        let log_entry = LogEntry {
+            num_frames_left,
+            fighter_id,
+            fighter_name,
+            stock_count,
+            status_kind: fighter_status_kind,
+            motion_kind: fighter_motion_kind,
+            damage: fighter_damage,
+            shield_size: fighter_shield_size,
+            facing,
+            pos_x,
+            pos_y,
+            hitstun_left,
+            attack_connected,
+            animation_frame_num,
+            can_act,
+            camera_position: Coordinate {
+                x: cam_pos.x,
+                y: cam_pos.y,
+                z: cam_pos.z,
+            },
+            camera_target_position: Coordinate {
+                x: cam_target.x,
+                y: cam_target.y,
+                z: cam_target.z,
+            },
+            camera_fov,
+            stage_id,
+            stick_position,
+            pressing_attack,
+            pressing_special,
+            pressing_shield,
+            pressing_jump,
+            pressing_grab,
+        };
+
+        let log_line = serde_json::to_string(&log_entry).unwrap();
+        println!("{}", log_line);
+        buffer.push_str(&format!("{}\n", log_line));
     }
 }
 
@@ -308,39 +346,42 @@ pub struct SceneQueue {
     previous_scene: FixedBaseString<64>,
 }
 
-#[skyline::hook(offset = 0x3724c10)]
-fn change_scene_sequence(
-    queue: &SceneQueue,
-    fnv1: &mut FixedBaseString<64>,
-    fnv2: &mut FixedBaseString<64>,
-    parameters: *const u8
-) {
-    if
-        &fnv1.string[0..24] == b"OnlineShareSequenceScene" &&
-        &fnv2.string[0..17] == b"MenuSequenceScene"
-    {
-        println!("[ult-logger] Made it to Shared Content!");
-        unsafe {
-            navigation::NAV = CurrentNavigation::ScWaitingForLoad;
-        }
+// Use this for general per-frame weapon-level hooks
+// Reference: https://gist.github.com/jugeeya/27b902865408c916b1fcacc486157f79
+pub fn once_per_weapon_frame(fighter_base: &mut L2CFighterBase) {
+    unsafe {
+        let module_accessor =
+            smash::app::sv_system::battle_object_module_accessor(fighter_base.lua_state_agent);
+        println!("[ult-logger] Frame : {}", smash::app::lua_bind::MotionModule::frame(module_accessor));
     }
-    call_original!(queue, fnv1, fnv2, parameters);
 }
 
-#[skyline::from_offset(0x39c4bb0)]
-fn begin_auto_sleep_disabled();
-
-#[skyline::hook(offset = 0x39c4bd0)]
-fn end_auto_sleep_disabled() {
-    // We don't want to auto-sleep ever, so don't let this end
+fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
+    match nro.name {
+        "common" => {
+            skyline::install_hooks!(on_match_start_or_end);
+        }
+        _ => (),
+    }
 }
 
-#[skyline::hook(offset = 0x39c4bc0)]
-fn kill_backlight() {
-    // We don't want to kill backlight ever, so don't let this happen
-}
+#[skyline::main(name = "ult_logger")]
+pub fn main() {
+    println!("[ult-logger] !!! v16 !!!");
 
-fn hook_panic() {
+    unsafe {
+        skyline::nn::ro::LookupSymbol(
+            &mut FIGHTER_MANAGER_ADDR,
+            "_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E\u{0}"
+                .as_bytes()
+                .as_ptr(),
+        );
+    }
+
+    skyline::nro::add_hook(nro_main).unwrap();
+
+    acmd::add_custom_hooks!(once_per_frame_per_fighter);
+
     std::panic::set_hook(
         Box::new(|info| {
             let location = info.location().unwrap();
@@ -363,65 +404,4 @@ fn hook_panic() {
             );
         })
     );
-}
-
-// Use this for general per-frame weapon-level hooks
-// Reference: https://gist.github.com/jugeeya/27b902865408c916b1fcacc486157f79
-pub fn once_per_weapon_frame(fighter_base: &mut L2CFighterBase) {
-    unsafe {
-        let module_accessor = smash::app::sv_system::battle_object_module_accessor(
-            fighter_base.lua_state_agent
-        );
-        println!("[ult-logger] Frame : {}", smash::app::lua_bind::MotionModule::frame(module_accessor));
-    }
-}
-
-fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
-    match nro.name {
-        "common" => {
-            skyline::install_hooks!(on_match_start_or_end);
-        }
-        _ => (),
-    }
-}
-
-#[skyline::main(name = "ult_logger")]
-pub fn main() {
-    println!("[ult-logger] !!! v16 !!!");
-
-    unsafe {
-        skyline::nn::ro::LookupSymbol(
-            &mut FIGHTER_MANAGER_ADDR,
-            "_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E\u{0}".as_bytes().as_ptr()
-        );
-    }
-
-    skyline::nro::add_hook(nro_main).unwrap();
-
-    acmd::add_custom_hooks!(once_per_frame_per_fighter);
-
-    // Add panic hook
-    hook_panic();
-
-    // Initialize hooks for navigation and keyboard
-    navigation::init();
-    keyboard::init();
-
-    // Initialize hooks for scene usage
-    skyline::install_hooks!(change_scene_sequence, kill_backlight, end_auto_sleep_disabled);
-
-    // Initialize hooks for input (from result_screen_skip)
-    std::thread::sleep(std::time::Duration::from_secs(20)); //makes it not crash on startup with arcrop bc ???
-    println!("[ult-logger] [Auto-Replay] Installing input hook...");
-    unsafe {
-        if (input::add_nn_hid_hook as *const ()).is_null() {
-            panic!(
-                "The NN-HID hook plugin could not be found and is required to add NRO hooks. Make sure libnn_hid_hook.nro is installed."
-            );
-        }
-        input::add_nn_hid_hook(input::handle_get_npad_state_start);
-
-        println!("[ult-logger] Disabling Auto Sleep");
-        begin_auto_sleep_disabled()
-    }
 }
