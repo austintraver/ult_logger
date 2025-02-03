@@ -4,16 +4,30 @@
 use lazy_static::lazy_static;
 use ninput::Controller;
 use serde::{Deserialize, Serialize};
+use singletons::ItemManager;
 use skyline;
 use skyline::nn::time;
 use smash::app::{sv_information, sv_module_access, sv_system, FighterInformation, Item};
 use smash::app::{FighterEntryID, Fighter_get_id_from_entry_id};
-use smash::lib::lua_const::*;
+use EffectModule::get_variation_effect_kind;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicU32, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use smash;
+use smash::lua2cpp::*;
+use smash::phx::*;
+use smash::app::sv_animcmd::*;
+use smash::app::lua_bind::*;
+use smash::app::*;
+use smash::lib::lua_const::*;
+use smash::hash40;
+// use smash_script::*;
+use smashline::*;
+
+
 
 lazy_static! {
     static ref FILE_PATH: Mutex<String> = Mutex::new(String::new());
@@ -36,18 +50,6 @@ extern "C" {
 
     #[link_name = "\u{1}_ZN3app14sv_information8stage_idEv"]
     pub fn get_stage_id() -> i32;
-
-    #[link_name = "\u{1}_ZN3app17sv_camera_manager7get_posEv"]
-    pub fn get_camera_pos() -> SimdVector3;
-
-    #[link_name = "\u{1}_ZN3app17sv_camera_manager16get_internal_posEv"]
-    pub fn get_internal_camera_pos() -> SimdVector3;
-
-    #[link_name = "\u{1}_ZN3app17sv_camera_manager10get_targetEv"]
-    pub fn get_camera_target() -> SimdVector3;
-
-    #[link_name = "\u{1}_ZN3app17sv_camera_manager7get_fovEv"]
-    pub fn get_camera_fov() -> f32;
 }
 
 // 0 - we haven't started logging.
@@ -55,18 +57,14 @@ extern "C" {
 // 2 - we have finished logging.
 static LOGGING_STATE: AtomicU32 = AtomicU32::new(0);
 
-static mut FIGHTER_MANAGER_ADDR: usize = 0;
-static mut ITEM_MANAGER_ADDR: usize = 0;
-
 #[skyline::hook(replace = smash::lua2cpp::L2CFighterBase_global_reset)]
-fn on_match_start_or_end(fighter: &mut smash::lua2cpp::L2CFighterBase) -> smash::lib::L2CValue {
+fn on_match_start_or_end(fighter: &mut L2CFighterBase) -> smash::lib::L2CValue {
     println!(
         "[ult-logger] Hit on_match_start_or_end with logging_state = {}",
         LOGGING_STATE.load(Ordering::SeqCst)
     );
-    let fighter_manager = unsafe { *(FIGHTER_MANAGER_ADDR as *mut *mut smash::app::FighterManager) };
-    let is_ready_go = unsafe { smash::app::lua_bind::FighterManager::is_ready_go(fighter_manager) };
-    let is_result_mode = unsafe { smash::app::lua_bind::FighterManager::is_result_mode(fighter_manager) };
+    let is_ready_go = unsafe { smash::app::lua_bind::FighterManager::is_ready_go(singletons::FighterManager()) };
+    let is_result_mode = unsafe { smash::app::lua_bind::FighterManager::is_result_mode(singletons::FighterManager()) };
 
     if !is_ready_go && !is_result_mode && LOGGING_STATE.load(Ordering::SeqCst) != 1 {
         // We are in the starting state, it's time to create a log.
@@ -170,13 +168,10 @@ struct LogEntry {
     attack_connected: bool,
     animation_frame_num: f32,
     can_act: bool,
-    camera_position: Coordinate,
-    camera_target_position: Coordinate,
-    camera_fov: f32,
     stage_id: i32,
 }
 
-pub fn once_per_frame_per_fighter(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
+pub fn once_per_frame_per_fighter(fighter: &mut L2CFighterCommon) {
     let mut fighter_log_count = FIGHTER_LOG_COUNT.lock().unwrap();
     *fighter_log_count += 1;
 
@@ -184,11 +179,10 @@ pub fn once_per_frame_per_fighter(fighter: &mut smash::lua2cpp::L2CFighterCommon
 
     let lua_state = fighter.lua_state_agent;
     let module_accessor = unsafe { sv_system::battle_object_module_accessor(lua_state) };
-    let fighter_manager = unsafe { *(FIGHTER_MANAGER_ADDR as *mut *mut smash::app::FighterManager) };
     let fighter_entry_id = unsafe { smash::app::lua_bind::WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as i32 };
     let fighter_skin = unsafe { smash::app::lua_bind::WorkModule::get_int(module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_COLOR) as i32 };
     let fighter_kind = unsafe { smash::app::utility::get_kind(module_accessor) };
-    let is_ready_go = unsafe { smash::app::lua_bind::FighterManager::is_ready_go(fighter_manager) };
+    let is_ready_go = unsafe { smash::app::lua_bind::FighterManager::is_ready_go(singletons::FighterManager()) };
     let is_training_mode = unsafe { smash::app::smashball::is_training_mode() };
 
 
@@ -204,19 +198,17 @@ pub fn once_per_frame_per_fighter(fighter: &mut smash::lua2cpp::L2CFighterCommon
         // log_item(fighter);
 
         // Have a 1/60 chance of triggering the code below:
-        if let rand = rand::random::<u8>() % 60 {
-            log_status(fighter);
-            log_all_items(fighter);
-        }
+        // if let rand = rand::random::<u8>() % 60 {
+        //     log_status(fighter);
+        //     log_all_items(fighter);
+        // }
     }
 }
 
-unsafe fn log_entry(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
+unsafe fn log_entry(fighter: &mut L2CFighterCommon) {
 
-        let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-
-        let fighter_manager = *(FIGHTER_MANAGER_ADDR as *mut *mut smash::app::FighterManager);
         // Get the fighter's battle object module accessor.
+        let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
 
         let num_frames_left = get_remaining_time_as_frame();
 
@@ -226,11 +218,9 @@ unsafe fn log_entry(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
         );
 
         let fighter_information = smash::app::lua_bind::FighterManager::get_fighter_information(
-            fighter_manager,
+            singletons::FighterManager(),
             smash::app::FighterEntryID(fighter_id)
         ) as *mut FighterInformation;
-
-
 
         let stock_count = smash::app::lua_bind::FighterInformation::stock_count(fighter_information) as u8;
         let fighter_status_kind = smash::app::lua_bind::StatusModule::status_kind(boma);
@@ -253,9 +243,6 @@ unsafe fn log_entry(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
         let pos_x = smash::app::lua_bind::PostureModule::pos_x(boma);
         let pos_y = smash::app::lua_bind::PostureModule::pos_y(boma);
         let facing = smash::app::lua_bind::PostureModule::lr(boma);
-        let cam_pos = get_camera_pos();
-        let cam_target = get_camera_target();
-        let camera_fov = get_camera_fov();
         let stage_id = get_stage_id();
         let animation_frame_num = smash::app::lua_bind::MotionModule::frame(boma);
 
@@ -289,17 +276,6 @@ unsafe fn log_entry(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
             attack_connected,
             animation_frame_num,
             can_act,
-            camera_position: Coordinate {
-                x: cam_pos.x,
-                y: cam_pos.y,
-                z: cam_pos.z,
-            },
-            camera_target_position: Coordinate {
-                x: cam_target.x,
-                y: cam_target.y,
-                z: cam_target.z,
-            },
-            camera_fov,
             stage_id,
         };
 
@@ -310,7 +286,7 @@ unsafe fn log_entry(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
 }
 
 // Log the current position of the player's control stick.
-unsafe fn log_stick_inputs(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
+unsafe fn log_stick_inputs(fighter: &mut L2CFighterCommon) {
 
     let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
     let x = smash::app::lua_bind::ControlModule::get_stick_x(boma);
@@ -321,7 +297,7 @@ unsafe fn log_stick_inputs(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
 }
 
 // Log current controller stick inputs.
-unsafe fn log_realtime_stick_inputs(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
+unsafe fn log_realtime_stick_inputs(fighter: &mut L2CFighterCommon) {
 
     if let Some(controller) = Controller::get_from_id(0) {
         let left_stick = controller.left_stick;
@@ -332,7 +308,7 @@ unsafe fn log_realtime_stick_inputs(fighter: &mut smash::lua2cpp::L2CFighterComm
 }
 
 // Log the current buttons being pressed by the player.
-unsafe fn log_button_presses(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
+unsafe fn log_button_presses(fighter: &mut L2CFighterCommon) {
     let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
 
     // Check which buttons are being pressed by the player:
@@ -354,22 +330,7 @@ unsafe fn log_button_presses(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
     return;
 }
 
-unsafe fn log_status(fighter: &mut smash::lua2cpp::L2CFighterBase) {
-    let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
-    if smash::app::lua_bind::StatusModule::status_kind(boma) == FIGHTER_PEACH_STATUS_KIND_UNIQ_FLOAT {
-        println!("Peach is floating.");
-    }
-    if smash::app::lua_bind::StatusModule::status_kind(boma) == FIGHTER_STATUS_KIND_CLIFF_WAIT {
-        println!("Hanging on the ledge.");
-    }
-    if smash::app::lua_bind::StatusModule::status_kind(boma) == FIGHTER_STATUS_KIND_ITEM_THROW {
-        println!("Peach is throwing an item.");
-    }
-
-    return;
-}
-
-unsafe fn log_item(fighter: &mut smash::lua2cpp::L2CFighterBase) {
+unsafe fn log_item(fighter: &mut L2CFighterBase) {
     let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
 
     // If the fighter doesn't have an item, return.
@@ -399,10 +360,10 @@ unsafe fn log_item(fighter: &mut smash::lua2cpp::L2CFighterBase) {
     return;
 }
 
-unsafe fn log_all_items(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
+unsafe fn log_all_items(fighter: &mut L2CFighterCommon) {
     let fighter_boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
 
-    let item_manager = *(ITEM_MANAGER_ADDR as *mut *mut smash::app::ItemManager);
+    let item_manager = singletons::ItemManager();
     (0..smash::app::lua_bind::ItemManager::get_num_of_active_item_all(item_manager)).for_each(|item_idx| {
         let item = smash::app::lua_bind::ItemManager::get_active_item(item_manager, item_idx);
         if item != 0 {
@@ -414,36 +375,6 @@ unsafe fn log_all_items(fighter: &mut smash::lua2cpp::L2CFighterCommon) {
     });
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct FixedBaseString<const N: usize> {
-    fnv: u32,
-    string_len: u32,
-    string: [u8; N],
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct SceneQueue {
-    end: *const u64,
-    start: *const u64,
-    count: usize,
-    active_scene: FixedBaseString<64>,
-    previous_scene: FixedBaseString<64>,
-}
-
-// Use this for general per-frame weapon-level hooks
-// Reference: https://gist.github.com/jugeeya/27b902865408c916b1fcacc486157f79
-pub fn once_per_weapon_frame(fighter_base: &mut smash::lua2cpp::L2CFighterBase) {
-    unsafe {
-        let boma = smash::app::sv_system::battle_object_module_accessor(fighter_base.lua_state_agent);
-        println!(
-            "[ult-logger] Frame : {}",
-            smash::app::lua_bind::MotionModule::frame(boma)
-        );
-    }
-}
-
 fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
     match nro.name {
         "common" => {
@@ -453,41 +384,333 @@ fn nro_main(nro: &skyline::nro::NroInfo<'_>) {
     }
 }
 
-#[skyline::main(name = "ult_logger")]
-pub fn main() {
-    println!("[ult-logger] !!! v16 !!!");
 
-    unsafe {
-        skyline::nn::ro::LookupSymbol(
-            &mut FIGHTER_MANAGER_ADDR,
-            "_ZN3lib9SingletonIN3app14FighterManagerEE9instance_E\u{0}"
-                .as_bytes()
-                .as_ptr(),
-        );
+// Used to store the damage taken by each fighter since the last frame.
+static mut current_damage: [f32; 8] = [0.0; 8];
+
+// I learned on Discord that you can use `fighter` to make a once-per-fighter-frame
+// function that works for all fighters. This is useful for logging data.
+// Source: https://discord.com/channels/447823426061860879/699809178658668615/1229538437070065674
+unsafe extern "C" fn fighter_frame(fighter: &mut L2CFighterCommon) {
+    let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+    // Log when a fighter takes damage.
+    let entry_id = WorkModule::get_int(fighter.module_accessor, *FIGHTER_INSTANCE_WORK_ID_INT_ENTRY_ID) as usize;
+    // Check if the fighter has taken damage since the last frame.
+    if current_damage[entry_id] != DamageModule::damage(boma, 0) {
+        let previous_damage = current_damage[entry_id];
+        let updated_damage = DamageModule::damage(boma, 0);
+        // Update the recorded damage value for this fighter.
+        current_damage[entry_id] = updated_damage;
+        // Print a message to the console indicating that the fighter took damage.
+        if updated_damage > previous_damage {
+            println!("Player {} took damage! {:.2}% -> {:.2}%", entry_id + 1, previous_damage, updated_damage);
+        }
+    }
+    if smash::app::lua_bind::StatusModule::status_kind(boma) == FIGHTER_STATUS_KIND_CLIFF_WAIT {
+        println!("Player {} is hanging on the ledge.", entry_id + 1);
+    }
+    if smash::app::lua_bind::StatusModule::status_kind(boma) == FIGHTER_STATUS_KIND_ITEM_THROW {
+        println!("Player {} threw an item.", entry_id + 1);
     }
 
-    skyline::nro::add_hook(nro_main).unwrap();
+    // TODO: AttackModule::is_infliction
+    //  Returns whether or not you are currently hitting an opponent (in hitlag).
 
-    acmd::add_custom_hooks!(once_per_frame_per_fighter);
+    // TODO: AttackModule::is_infliction_status
+    //  Returns whether or not you have hit something during the current status
 
-    std::panic::set_hook(Box::new(|info| {
-        let location = info.location().unwrap();
+    // TODO: ControlModule::get_stick_x
+    // TODO: ControlModule::get_stick_y
+    // TODO: ControlModule::get_stick_x_no_clamp
+    // TODO: ControlModule::get_stick_y_no_clamp
+    // TODO: ControlModule::get_stick_angle
+    // TODO: ControlModule::get_stick_dir
+    // TODO: ControlModule::get_command_flag_cat
+    // TODO: ControlModule::check_button_on
+    // TODO: ControlModule::check_button_off
+    // TODO: ControlModule::check_button_trigger
 
-        let msg = match info.payload().downcast_ref::<&'static str>() {
-            Some(s) => *s,
-            None => match info.payload().downcast_ref::<String>() {
-                Some(s) => &s[..],
-                None => "Box<Any>",
-            },
-        };
+    // TODO:MotionModule::frame
+    // TODO:MotionModule::end_frame
 
-        let err_msg = format!("thread has panicked at '{}', {}", msg, location);
-        skyline::error::show_error(
-                69,
-                "Skyline plugin has panicked! Please open the details and send a screenshot to the developer, then close the game.\n\0",
-                err_msg.as_str()
-            );
-    }));
+    // TODO:StatusModule::status_kind
+    // TODO:StatusModule::situation_kind
+    // TODO:StatusModule::is_situation_changed
+
+    // TODO:KineticModule::get_sum_speed3f
+    // TODO:KineticModule::get_sum_speed
+
+    // StopModule::get_hit_stop_real_frame - Rust
+
+    /*
+
+     damage_fly_speed_up_reaction_frame_min    (Minimum hitstun frames threshold to trigger balloon knockback (30))
+     damage_fly_speed_up_reaction_frame_max    (Maximum hitstun frames for balloon knockback to stop scaling (80))
+     damage_fly_speed_up_end_rate
+     damage_fly_speed_up_max_mag (Maximum balloon knockback speed up multiplier (6))
+     damage_fly_speed_up_angle_base
+     damage_speed_up_max_mag is multiplied by ""Value"" where:
+        * Value = Linear Interpolation(1, angle_rate * 0.01, Ratio)
+        * Ratio = scaled from 0 to 1; 0 at angle_base +- min_max_angle; 1 at angle_base"
+     damage_fly_speed_up_min_max_angle
+     damage_fly_speed_up_angle_rate
+     */
+
+    /*
+    Note: WuBoytH's The-WuBor-Patch has some interesting code related to damage and knockback.
+    https://github.com/WuBoytH/The-WuBor-Patch/blob/cb5c11ef152741ac1aa01140a7323996d869136b/fighters/common/src/status/damage/damage.rs#L271-L277
+    What is
+    * FIGHTER_STATUS_DAMAGE_WORK_FLOAT_CORRECT_DAMAGE_VECTOR_ANGLE
+    * FIGHTER_STATUS_DAMAGE_WORK_FLOAT_REACTION_FRAME
+    * FIGHTER_STATUS_DAMAGE_WORK_FLOAT_VECOR_CORRECT_STICK_X
+    * FIGHTER_STATUS_DAMAGE_WORK_FLOAT_VECOR_CORRECT_STICK_Y
+    * FIGHTER_STATUS_KIND_DAMAGE_FLY_ROLL
+    * FIGHTER_STATUS_DAMAGE_WORK_FLOAT_ROT_ANGLE
+    * FIGHTER_STATUS_DAMAGE_FLAG_FLY_ROLL_SET_ANGLE
+     */
+}
+
+// Documentation:
+// https://github.com/HDR-Development/smashline/wiki/Migrating#migrating-opff
+unsafe extern "C" fn peach_frame(fighter: &mut L2CFighterCommon) {
+    // log_entry(fighter);
+    let boma = smash::app::sv_system::battle_object_module_accessor(fighter.lua_state_agent);
+    if smash::app::lua_bind::StatusModule::status_kind(boma) == FIGHTER_PEACH_STATUS_KIND_UNIQ_FLOAT {
+        println!("Peach is floating.");
+    }
+}
+
+extern "C" {
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_1_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_1_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_1_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_1_PROB() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_2_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_2_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_2_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_2_PROB() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_3_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_3_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_3_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_3_PROB() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_4_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_4_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_4_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_4_PROB() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_5_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_5_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_5_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_5_PROB() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_6_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_6_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_6_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_6_PROB() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_7_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_7_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_7_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_7_PROB() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon32PEACH_PEACHDAIKON_DAIKON_8_POWEREv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_8_POWER() -> f32;
+
+    #[link_name = "_ZN3app11peachdaikon31PEACH_PEACHDAIKON_DAIKON_8_PROBEv"]
+    pub fn PEACH_PEACHDAIKON_DAIKON_8_PROB() -> f32;
+
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_1_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_1_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_1_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_1_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_1_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_1_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_2_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_2_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_2_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_2_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_2_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_2_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_3_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_3_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_3_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_3_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_3_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_3_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_4_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_4_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_4_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_4_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_4_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_4_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_5_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_5_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_5_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_5_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_5_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_5_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_6_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_6_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_6_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_6_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_6_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_6_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_7_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_7_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_7_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_7_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_7_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_7_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_8_POWER)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_8_POWER() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_8_POWER");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::hook(replace = PEACH_PEACHDAIKON_DAIKON_8_PROB)]
+pub unsafe fn handle_PEACH_PEACHDAIKON_DAIKON_8_PROB() -> f32 {
+    println!("handle_PEACH_PEACHDAIKON_DAIKON_8_PROB");
+    let orig = original!()();
+    dbg!(orig);
+    return orig;
+}
+
+#[skyline::main(name = "ult_logger")]
+pub fn main() {
+
+    skyline::install_hooks!(
+        handle_PEACH_PEACHDAIKON_DAIKON_1_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_1_PROB,
+        handle_PEACH_PEACHDAIKON_DAIKON_2_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_2_PROB,
+        handle_PEACH_PEACHDAIKON_DAIKON_3_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_3_PROB,
+        handle_PEACH_PEACHDAIKON_DAIKON_4_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_4_PROB,
+        handle_PEACH_PEACHDAIKON_DAIKON_5_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_5_PROB,
+        handle_PEACH_PEACHDAIKON_DAIKON_6_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_6_PROB,
+        handle_PEACH_PEACHDAIKON_DAIKON_7_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_7_PROB,
+        handle_PEACH_PEACHDAIKON_DAIKON_8_POWER,
+        handle_PEACH_PEACHDAIKON_DAIKON_8_PROB
+    );
+    // println!("[ult_logger]");
+
+    // skyline::nro::add_hook(nro_main).unwrap();
+
+    Agent::new("peach")
+        .on_line(Main, peach_frame)
+        .install();
+
+    Agent::new("fighter")
+        .on_line(Main, fighter_frame)
+        .install();
+
+    // std::panic::set_hook(Box::new(|info| {
+
+    //     let location = info.location().unwrap();
+
+    //     let msg = match info.payload().downcast_ref::<&'static str>() {
+    //         Some(s) => *s,
+    //         None => match info.payload().downcast_ref::<String>() {
+    //             Some(s) => &s[..],
+    //             None => "Box<Any>",
+    //         },
+    //     };
+
+    //     let err_msg = format!("thread has panicked at '{}', {}", msg, location);
+    //     skyline::error::show_error(
+    //             69,
+    //             "Skyline plugin has panicked! Please open the details and send a screenshot to the developer, then close the game.\n\0",
+    //             err_msg.as_str()
+    //         );
+    // }));
 
     // input::init();
 }

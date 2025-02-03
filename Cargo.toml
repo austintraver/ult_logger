@@ -6,20 +6,30 @@ edition = "2021"
 
 [package.metadata.skyline]
 titleid = "01006A800016E000" # Smash Ultimate
+plugin-dependencies = [
+    { name = "libsmashline_plugin.nro", url = "https://github.com/HDR-Development/smashline/releases/download/v1.3.0/libsmashline_plugin.nro" },
+]
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-skyline = "0.2.1"
-skyline_smash = { git = "https://github.com/ultimate-research/skyline-smash.git" }
-# smash = { git = "https://github.com/blu-dev/smash-rs.git" }
-acmd = { git = "https://github.com/ultimate-research/skyline-acmd.git" }
+rand = "0.8.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 lazy_static = "1.3.0"
-ninput = { git = "https://github.com/blu-dev/ninput.git" }
-rand = "0.8.5"
+paste = "1.0"
+
+# skyline = "0.2.1"
+skyline = { git = "https://github.com/ultimate-research/skyline-rs "}
+# skyline_smash = { git = "https://github.com/ultimate-research/skyline-smash" }
+skyline_smash = { git = "https://github.com/blu-dev/skyline-smash", features = ["weak_l2cvalue"] }
+# smash = { git = "https://github.com/blu-dev/smash-rs" }
+ninput = { git = "https://github.com/blu-dev/ninput" }
+# acmd = { git = "https://github.com/ultimate-research/skyline-acmd" }
+smashline = { git = "https://github.com/HDR-Development/smashline"}
+# smash_script = { git = "https://github.com/blu-dev/smash-script.git", branch = "development" }
+smash_singletons = { git = "https://github.com/WuBoytH/smash_singletons.git" }
 
 [patch.crates-io]
 native-tls = { git = "https://github.com/skyline-rs/rust-native-tls", branch = "switch-timeout-panic" }
